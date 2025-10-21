@@ -10,6 +10,9 @@ pub enum Error {
     Model(String),
     Tokenizer(String),
     Config(String),
+    RtenLoad(rten::LoadError),
+    RtenRun(rten::RunError),
+    RtenValue(rten::TryFromValueError),
 }
 
 impl fmt::Display for Error {
@@ -21,6 +24,9 @@ impl fmt::Display for Error {
             Error::Model(msg) => write!(f, "Model error: {msg}"),
             Error::Tokenizer(msg) => write!(f, "Tokenizer error: {msg}"),
             Error::Config(msg) => write!(f, "Config error: {msg}"),
+            Error::RtenLoad(e) => write!(f, "RTen load error: {e}"),
+            Error::RtenRun(e) => write!(f, "RTen run error: {e}"),
+            Error::RtenValue(e) => write!(f, "RTen value error: {e}"),
         }
     }
 }
@@ -36,6 +42,24 @@ impl From<std::io::Error> for Error {
 impl From<ort::Error> for Error {
     fn from(e: ort::Error) -> Self {
         Error::Ort(e)
+    }
+}
+
+impl From<rten::LoadError> for Error {
+    fn from(e: rten::LoadError) -> Self {
+        Error::RtenLoad(e)
+    }
+}
+
+impl From<rten::RunError> for Error {
+    fn from(e: rten::RunError) -> Self {
+        Error::RtenRun(e)
+    }
+}
+
+impl From<rten::TryFromValueError> for Error {
+    fn from(e: rten::TryFromValueError) -> Self {
+        Error::RtenValue(e)
     }
 }
 
