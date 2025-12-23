@@ -21,8 +21,8 @@
 
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig;
-use ndarray::{s, Array1, Array2, Array3, Axis};
-use ort::session::Session;
+use ndarray::{s, Array2, Array3, Axis};
+use rten::{Model, Value, ValueView};
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::f32::consts::PI;
 use std::path::Path;
@@ -169,7 +169,7 @@ pub struct SpeakerSegment {
 
 /// Streaming Sortformer v2 speaker diarization engine
 pub struct Sortformer {
-    session: Session,
+    model: Model,
     config: DiarizationConfig,
     // Streaming state. note that, Same way as Nemo
     spkcache: Array3<f32>,               // (1, 0..SPKCACHE_LEN, EMB_DIM)
@@ -191,19 +191,16 @@ impl Sortformer {
     /// Create with custom config
     pub fn with_config<P: AsRef<Path>>(
         model_path: P,
-        execution_config: Option<ModelConfig>,
+        _execution_config: Option<ModelConfig>,
         config: DiarizationConfig,
     ) -> Result<Self> {
-        let config_to_use = execution_config.unwrap_or_default();
-
-        let session = config_to_use
-            .apply_to_session_builder(Session::builder()?)?
-            .commit_from_file(model_path.as_ref())?;
+        // Safety: We assume the model will not be modified on disk while in use.
+        let model = unsafe { Model::load_mmap(model_path.as_ref()) }?;
 
         let mel_basis = Self::create_mel_filterbank();
 
         let mut instance = Self {
-            session,
+            model,
             config,
             spkcache: Array3::zeros((1, 0, EMB_DIM)),
             spkcache_preds: None,
@@ -310,11 +307,6 @@ impl Sortformer {
         let spkcache_len = self.spkcache.shape()[1];
         let fifo_len = self.fifo.shape()[1];
 
-        // Prepare inputs
-        let chunk_lengths = Array1::from_vec(vec![current_len as i64]);
-        let spkcache_lengths = Array1::from_vec(vec![spkcache_len as i64]);
-        let fifo_lengths = Array1::from_vec(vec![fifo_len as i64]);
-
         // Prepare FIFO input
         let fifo_input = if fifo_len > 0 {
             self.fifo.clone()
@@ -330,55 +322,63 @@ impl Sortformer {
         };
 
         // Create input values
-        let chunk_value = ort::value::Value::from_array(chunk_feat.clone())?;
-        let chunk_lengths_value = ort::value::Value::from_array(chunk_lengths)?;
-        let spkcache_value = ort::value::Value::from_array(spkcache_input)?;
-        let spkcache_lengths_value = ort::value::Value::from_array(spkcache_lengths)?;
-        let fifo_value = ort::value::Value::from_array(fifo_input)?;
-        let fifo_lengths_value = ort::value::Value::from_array(fifo_lengths)?;
+        let chunk_feat_layout = chunk_feat.as_standard_layout();
+        let chunk_value = ValueView::from_shape(
+            chunk_feat_layout.shape(),
+            chunk_feat_layout.as_slice().unwrap(),
+        )
+        .unwrap();
+        let chunk_lengths_value = Value::from_shape([1], vec![current_len as i32]).unwrap();
 
-        // Run ONNX inference and extract all data in a block to release borrow
+        let spkcache_layout = spkcache_input.as_standard_layout();
+        let spkcache_value =
+            ValueView::from_shape(spkcache_layout.shape(), spkcache_layout.as_slice().unwrap())
+                .unwrap();
+        let spkcache_lengths_value = Value::from_shape([1], vec![spkcache_len as i32]).unwrap();
+
+        let fifo_layout = fifo_input.as_standard_layout();
+        let fifo_value =
+            ValueView::from_shape(fifo_layout.shape(), fifo_layout.as_slice().unwrap()).unwrap();
+        let fifo_lengths_value = Value::from_shape([1], vec![fifo_len as i32]).unwrap();
+
+        // Run inference and extract all data
         let (preds, new_embs, chunk_len) = {
-            let outputs = self.session.run(ort::inputs!(
-                "chunk" => chunk_value,
-                "chunk_lengths" => chunk_lengths_value,
-                "spkcache" => spkcache_value,
-                "spkcache_lengths" => spkcache_lengths_value,
-                "fifo" => fifo_value,
-                "fifo_lengths" => fifo_lengths_value
-            ))?;
+            let [preds_out, embs_out] = self.model.run_n(
+                vec![
+                    (self.model.node_id("chunk")?, chunk_value.into()),
+                    (
+                        self.model.node_id("chunk_lengths")?,
+                        chunk_lengths_value.into(),
+                    ),
+                    (self.model.node_id("spkcache")?, spkcache_value.into()),
+                    (
+                        self.model.node_id("spkcache_lengths")?,
+                        spkcache_lengths_value.into(),
+                    ),
+                    (self.model.node_id("fifo")?, fifo_value.into()),
+                    (
+                        self.model.node_id("fifo_lengths")?,
+                        fifo_lengths_value.into(),
+                    ),
+                ],
+                [
+                    self.model.node_id("spkcache_fifo_chunk_preds")?,
+                    self.model.node_id("chunk_pre_encode_embs")?,
+                ],
+                None,
+            )?;
 
             // Extract outputs
-            let (preds_shape, preds_data) = outputs["spkcache_fifo_chunk_preds"]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| Error::Model(format!("Failed to extract preds: {e}")))?;
-            let (embs_shape, embs_data) = outputs["chunk_pre_encode_embs"]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| Error::Model(format!("Failed to extract embs: {e}")))?;
+            let (preds_dims, preds_data) = preds_out.into_shape_vec::<f32, 3>()?;
+            let (embs_dims, embs_data) = embs_out.into_shape_vec::<f32, 3>()?;
 
-            // Convert to ndarray
-            let preds_dims = preds_shape.as_ref();
-            let embs_dims = embs_shape.as_ref();
+            let preds =
+                Array3::from_shape_vec((preds_dims[0], preds_dims[1], preds_dims[2]), preds_data)
+                    .map_err(|e| Error::Model(format!("Failed to reshape preds: {e}")))?;
 
-            let preds = Array3::from_shape_vec(
-                (
-                    preds_dims[0] as usize,
-                    preds_dims[1] as usize,
-                    preds_dims[2] as usize,
-                ),
-                preds_data.to_vec(),
-            )
-            .map_err(|e| Error::Model(format!("Failed to reshape preds: {e}")))?;
-
-            let new_embs = Array3::from_shape_vec(
-                (
-                    embs_dims[0] as usize,
-                    embs_dims[1] as usize,
-                    embs_dims[2] as usize,
-                ),
-                embs_data.to_vec(),
-            )
-            .map_err(|e| Error::Model(format!("Failed to reshape embs: {e}")))?;
+            let new_embs =
+                Array3::from_shape_vec((embs_dims[0], embs_dims[1], embs_dims[2]), embs_data)
+                    .map_err(|e| Error::Model(format!("Failed to reshape embs: {e}")))?;
 
             // Calculate valid frames
             let valid_frames = (current_len + SUBSAMPLING - 1) / SUBSAMPLING;
